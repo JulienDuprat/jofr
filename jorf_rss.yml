@@ -1,0 +1,328 @@
+name: JORF → RSS avec PDF et résumé
+
+on:
+  schedule:
+    - cron: "7 6 * * *"   # Tous les jours à 06:07 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout défaut (pour le workflow)
+        uses: actions/checkout@v4
+
+      - name: Checkout gh-pages dans ./site (créé si absent)
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: site
+          persist-credentials: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 lxml urllib3 pdfminer.six
+
+      - name: Génère PDF + résumé + RSS
+        env:
+          USER_AGENT: "Collecteur-JORF/1.0 (+contact: contact@example.com)"
+          # Optionnel: remplace par ton domaine si tu as un custom domain pour Pages
+          SITE_BASE: ""
+          MAX_ITEMS: "60"   # Limite d'items dans le flux (0 = illimité)
+        run: |
+          python - <<'PY'
+          import os, re, sys, time, hashlib, datetime as dt, html
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+          from pdfminer.high_level import extract_text
+
+          BASE_URL = "https://www.legifrance.gouv.fr/jorf/jo"
+          SITE_DIR = "site"
+          PDF_DIR = os.path.join(SITE_DIR, "pdf")
+          FEED_PATH = os.path.join(SITE_DIR, "feed.xml")
+          USER_AGENT = os.environ.get("USER_AGENT","Collecteur-JORF/1.0")
+          MAX_ITEMS = int(os.environ.get("MAX_ITEMS","60") or "0")
+
+          # Déterminer base publique du site (GitHub Pages)
+          owner = os.environ.get("GITHUB_REPOSITORY_OWNER","")
+          repo = os.environ.get("GITHUB_REPOSITORY","").split("/")[-1] if os.environ.get("GITHUB_REPOSITORY") else ""
+          default_base = f"https://{owner}.github.io/{repo}" if owner and repo else ""
+          SITE_BASE = os.environ.get("SITE_BASE") or default_base
+
+          def session_with_retry():
+              s = requests.Session()
+              retries = Retry(total=5, backoff_factor=0.8,
+                              status_forcelist=[429,500,502,503,504],
+                              allowed_methods=["GET","HEAD"],
+                              raise_on_status=False)
+              s.headers.update({
+                  "User-Agent": USER_AGENT,
+                  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                  "Accept-Language": "fr,fr-FR;q=0.9,en;q=0.8",
+              })
+              s.mount("https://", HTTPAdapter(max_retries=retries))
+              s.mount("http://", HTTPAdapter(max_retries=retries))
+              return s
+
+          def normalize(s: str) -> str:
+              import unicodedata
+              s = unicodedata.normalize("NFKD", s)
+              s = "".join(ch for ch in s if not unicodedata.combining(ch))
+              s = s.lower()
+              s = re.sub(r"\s+"," ", s).strip()
+              return s
+
+          def find_latest_issue_url(html, base=BASE_URL):
+              soup = BeautifulSoup(html, "lxml")
+              # Section « Derniers JO publiés »
+              section = None
+              for h in soup.find_all(["h2","h3","h4"]):
+                  if normalize(h.get_text()).startswith("derniers jo publies"):
+                      section = h.find_parent() or h
+                      break
+              if not section:
+                  section = soup
+              def score(a):
+                  href = a.get("href","")
+                  t = normalize(a.get_text(" ", strip=True))
+                  sc = 0
+                  if re.search(r"/jorf/(jo|id)/", href): sc += 3
+                  if "journal officiel" in t or "jorf" in t: sc += 2
+                  if re.search(r"\d{4}", t): sc += 1
+                  return sc
+              candidates = sorted(section.find_all("a", href=True), key=score, reverse=True)
+              for a in candidates:
+                  if score(a) >= 3:
+                      return urljoin(base, a["href"])
+              return urljoin(base, candidates[0]["href"]) if candidates else None
+
+          TARGET_PATTERNS = [
+              "telecharger le journal officiel authentifie",
+              "journal officiel authentifie",
+              "jo authentifie",
+              "pdf authentifie",
+          ]
+
+          def find_pdf_url(html, base):
+              soup = BeautifulSoup(html, "lxml")
+              for a in soup.find_all("a", href=True):
+                  label = normalize(a.get_text(" ", strip=True))
+                  if any(p in label for p in TARGET_PATTERNS):
+                      return urljoin(base, a["href"])
+              for a in soup.find_all("a", href=True):
+                  meta = " ".join(filter(None, [a.get("title",""), a.get("aria-label",""), a.get("download","")]))
+                  if meta and any(p in normalize(meta) for p in TARGET_PATTERNS):
+                      return urljoin(base, a["href"])
+              for a in soup.find_all("a", href=True):
+                  href = a["href"]
+                  if href.lower().endswith(".pdf"):
+                      return urljoin(base, href)
+              for a in soup.find_all("a", href=True):
+                  if "pdf" in normalize(a.get_text(" ", strip=True)):
+                      return urljoin(base, a["href"])
+              return None
+
+          def safe_filename(name): return re.sub(r"[^A-Za-z0-9._-]+","_", name)
+
+          def download_pdf(s, url, out_path):
+              with s.get(url, stream=True, timeout=30) as r:
+                  r.raise_for_status()
+                  tmp = out_path + ".part"
+                  os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                  h = hashlib.sha256()
+                  total = 0
+                  with open(tmp, "wb") as f:
+                      for chunk in r.iter_content(chunk_size=1024*128):
+                          if not chunk: continue
+                          f.write(chunk); h.update(chunk); total += len(chunk)
+                  os.replace(tmp, out_path)
+              return total, h.hexdigest()
+
+          def extract_text_safely(pdf_path):
+              try:
+                  txt = extract_text(pdf_path) or ""
+                  return txt
+              except Exception as e:
+                  return ""
+
+          def summarize(text, max_sent=6):
+              # Découpage simple en phrases FR
+              sents = re.split(r'(?<=[.!?])\\s+|\\n+', text)
+              sents = [s.strip() for s in sents if len(s.strip()) > 0]
+              if not sents:
+                  return "Résumé indisponible."
+              # Fréquences
+              STOP = set(\"\"\"le la les un une des de du au aux et ou mais donc or ni car à a d en dans sur sous par pour plus ne pas que qui quoi où quand comme ce cet cette ces il elle ils elles nous vous leur leurs vos vos-mêmes vos-memes vosmêmes vosmemes leurs-mêmes leurs-memes leursmêmes leursmemes je tu vous on se s’ s' l’ l' au aux auxdites auxdits auxdit auj aujourd’hui aujourd'hui être etre été ete etant étant avoir a eu ont sont est sera seront seraient serait étaient etaient\"\"\".split())
+              # Calculer scores par mot
+              words = re.findall(r"[A-Za-zÀ-ÿ']+", text.lower())
+              freqs = {}
+              for w in words:
+                  if w in STOP or len(w) < 3: continue
+                  freqs[w] = freqs.get(w,0)+1
+              if not freqs:
+                  return " ".join(sents[:min(max_sent, len(sents))])
+              maxf = max(freqs.values())
+              for k in list(freqs.keys()):
+                  freqs[k] /= maxf
+              # Score des phrases
+              def score_sent(s):
+                  ws = re.findall(r"[A-Za-zÀ-ÿ']+", s.lower())
+                  return sum(freqs.get(w,0) for w in ws) / (1 + len(ws))
+              ranked = sorted(((score_sent(s), i, s) for i,s in enumerate(sents)), reverse=True)
+              # Choisir top N en conservant l'ordre original
+              top = sorted(ranked[:max_sent], key=lambda x: x[1])
+              return " ".join(s for _,_,s in top)
+
+          def rfc822(dtobj):
+              # Thu, 21 Dec 2000 16:01:07 +0200
+              return dtobj.strftime("%a, %d %b %Y %H:%M:%S +0000")
+
+          def ensure_feed(channel_title, channel_link, channel_desc):
+              # Créer squelette si absent
+              if not os.path.exists(FEED_PATH):
+                  os.makedirs(SITE_DIR, exist_ok=True)
+                  with open(FEED_PATH, "w", encoding="utf-8") as f:
+                      f.write(f'''<?xml version="1.0" encoding="UTF-8"?>\\n
+          <rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+            <channel>
+              <title>{html.escape(channel_title)}</title>
+              <link>{html.escape(channel_link)}</link>
+              <description>{html.escape(channel_desc)}</description>
+              <language>fr-fr</language>
+              <lastBuildDate>{rfc822(dt.datetime.utcnow())}</lastBuildDate>
+            </channel>
+          </rss>''')
+              # Charger tout
+              with open(FEED_PATH, "r", encoding="utf-8") as f:
+                  xml = f.read()
+              return xml
+
+          def append_item(xml, item_xml):
+              # Insérer avant </channel>
+              xml = re.sub(r"</lastBuildDate>.*?</channel>", f"</lastBuildDate>\\n{item_xml}\\n</channel>", xml, flags=re.S)
+              # Mettre à jour lastBuildDate
+              xml = re.sub(r"<lastBuildDate>.*?</lastBuildDate>", f"<lastBuildDate>{rfc822(dt.datetime.utcnow())}</lastBuildDate>", xml, flags=re.S)
+              return xml
+
+          def parse_items(xml):
+              return re.findall(r"<item>.*?</item>", xml, flags=re.S)
+
+          def dedupe_and_limit(xml, guid):
+              # Si item avec ce guid existe, ne pas dupliquer
+              if re.search(fr"<guid>\\s*{re.escape(guid)}\\s*</guid>", xml):
+                  return xml
+              # Sinon on ajoutera un item; on limitera ensuite
+              return xml
+
+          # 1) Scraper
+          s = session_with_retry()
+          r = s.get(BASE_URL, timeout=20)
+          r.raise_for_status()
+          issue_url = find_latest_issue_url(r.text)
+          if not issue_url:
+              print("[ERREUR] dernier JO introuvable", file=sys.stderr); sys.exit(2)
+
+          r2 = s.get(issue_url, timeout=20); r2.raise_for_status()
+          pdf_url = find_pdf_url(r2.text, base=issue_url)
+          if not pdf_url:
+              print("[ERREUR] lien PDF « authentifié » introuvable", file=sys.stderr); sys.exit(3)
+
+          # 2) Datation
+          today = dt.date.today()
+          guess_date = today
+          m = re.search(r"(20\\d{2})[^\\d]?(0[1-9]|1[0-2])[^\\d]?([0-2]\\d|3[01])", r2.text)
+          if m:
+              try: guess_date = dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+              except: pass
+
+          # 3) Télécharger PDF vers gh-pages
+          os.makedirs(PDF_DIR, exist_ok=True)
+          pdf_name = f"JO-{guess_date.isoformat()}.pdf"
+          pdf_path = os.path.join(PDF_DIR, pdf_name)
+          size, sha = download_pdf(s, pdf_url, pdf_path)
+          print(f"[OK] PDF → {pdf_path} ({size} bytes)")
+
+          # 4) Résumé
+          text = extract_text_safely(pdf_path)
+          summary = summarize(text, max_sent=6)
+
+          # 5) URL publique du PDF
+          if not SITE_BASE:
+              print("[AVERTISSEMENT] SITE_BASE inconnu; le flux utilisera des URLs relatives.")
+              pdf_pub_url = f"./pdf/{pdf_name}"
+              feed_link = "./"
+          else:
+              pdf_pub_url = f"{SITE_BASE}/pdf/{pdf_name}"
+              feed_link = SITE_BASE
+
+          # 6) Créer/charger le flux et ajouter un item
+          channel_title = "Journal officiel - Flux PDF authentifié"
+          channel_desc  = "Derniers JO — PDF authentifié + résumé automatique"
+          xml = ensure_feed(channel_title, feed_link, channel_desc)
+
+          guid = f"jorf-{guess_date.isoformat()}"
+          xml = dedupe_and_limit(xml, guid)
+
+          title = f"Journal officiel du {guess_date.isoformat()}"
+          pubDate = rfc822(dt.datetime.combine(guess_date, dt.time(6,7)))  # heure approximative
+          enclosure = f'<enclosure url="{html.escape(pdf_pub_url)}" length="{size}" type="application/pdf"/>'
+          desc = html.escape(summary)
+          content = f"<![CDATA[<p>{html.escape(summary)}</p><p><a href='{html.escape(pdf_pub_url)}'>Télécharger le PDF</a></p>]]>"
+
+          item = f"""
+            <item>
+              <title>{html.escape(title)}</title>
+              <link>{html.escape(pdf_pub_url)}</link>
+              <guid>{html.escape(guid)}</guid>
+              <pubDate>{pubDate}</pubDate>
+              <description>{desc}</description>
+              <content:encoded>{content}</content:encoded>
+              {enclosure}
+            </item>
+          """
+
+          # Insérer l'item si non présent
+          if not re.search(fr"<guid>\\s*{re.escape(guid)}\\s*</guid>", xml):
+              xml = append_item(xml, item)
+
+          # Limiter le nombre d'items si demandé
+          if MAX_ITEMS and MAX_ITEMS > 0:
+              items = parse_items(xml)
+              if len(items) > MAX_ITEMS:
+                  # garder les MAX_ITEMS plus récents (ordre d'apparition après insertion)
+                  keep = items[-MAX_ITEMS:]
+                  # reconstruire le flux
+                  xml = re.sub(r"<item>.*?</item>", "", xml, flags=re.S)
+                  insertion = "\\n".join(keep)
+                  xml = re.sub(r"</lastBuildDate>.*?</channel>", f"</lastBuildDate>\\n{insertion}\\n</channel>", xml, flags=re.S)
+
+          with open(FEED_PATH, "w", encoding="utf-8") as f:
+              f.write(xml)
+
+          print(f"[OK] RSS mis à jour → {FEED_PATH}")
+          PY
+
+      - name: Commit & push to gh-pages
+        run: |
+          cd site
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          if git diff --cached --quiet; then
+            echo "Aucune modification à publier."
+          else
+            git commit -m "MAJ: PDF JO + feed.xml"
+            git push origin gh-pages
+          fi
