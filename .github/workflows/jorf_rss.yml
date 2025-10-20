@@ -1,1 +1,202 @@
+name: JORF - PDF authentifié quotidien
+
+on:
+  schedule:
+    # Tous les jours à 06:05 UTC (ajuste selon ton besoin)
+    - cron: "5 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  fetch-jorf:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (optionnel si tu veux committer le PDF)
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 lxml urllib3
+
+      - name: Run scraper
+        env:
+          OUT_DIR: "out"
+          USER_AGENT: "Collecteur-JORF/1.0 (+contact: contact@example.com)"
+        run: |
+          python - <<'PY'
+          import os, sys, re, hashlib, datetime as dt, time
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          BASE_URL = "https://www.legifrance.gouv.fr/jorf/jo"
+          OUT_DIR = os.environ.get("OUT_DIR", "out")
+          USER_AGENT = os.environ.get("USER_AGENT", "Collecteur-JORF/1.0")
+
+          def session_with_retry():
+              s = requests.Session()
+              retries = Retry(total=5, backoff_factor=0.8,
+                              status_forcelist=[429,500,502,503,504],
+                              allowed_methods=["GET","HEAD"],
+                              raise_on_status=False)
+              s.headers.update({
+                  "User-Agent": USER_AGENT,
+                  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                  "Accept-Language": "fr,fr-FR;q=0.9,en;q=0.8",
+              })
+              s.mount("https://", HTTPAdapter(max_retries=retries))
+              s.mount("http://", HTTPAdapter(max_retries=retries))
+              return s
+
+          def normalize_txt(s: str) -> str:
+              import unicodedata
+              s = unicodedata.normalize("NFKD", s)
+              s = "".join(ch for ch in s if not unicodedata.combining(ch))
+              s = s.lower()
+              s = re.sub(r"\s+", " ", s).strip()
+              return s
+
+          def find_latest_issue_url(html, base=BASE_URL):
+              soup = BeautifulSoup(html, "lxml")
+              # Repérer la section « Derniers JO publiés »
+              section = None
+              for h in soup.find_all(["h2","h3","h4"]):
+                  if normalize_txt(h.get_text()) .startswith("derniers jo publies"):
+                      parent = h.find_parent()
+                      section = parent if parent else h
+                      break
+              if not section:
+                  section = soup
+
+              def score(a):
+                  href = a.get("href","")
+                  t = normalize_txt(a.get_text(" ", strip=True))
+                  sc = 0
+                  if re.search(r"/jorf/(jo|id)/", href): sc += 3
+                  if "journal officiel" in t or "jorf" in t: sc += 2
+                  if re.search(r"\d{4}", t): sc += 1
+                  return sc
+
+              candidates = section.find_all("a", href=True)
+              candidates = sorted(candidates, key=score, reverse=True)
+              for a in candidates:
+                  if score(a) >= 3:
+                      return urljoin(base, a["href"])
+              return urljoin(base, candidates[0]["href"]) if candidates else None
+
+          TARGET_PATTERNS = [
+              "telecharger le journal officiel authentifie",
+              "journal officiel authentifie",
+              "jo authentifie",
+              "pdf authentifie",
+          ]
+
+          def find_pdf_url(html, base):
+              soup = BeautifulSoup(html, "lxml")
+              # 1) Lien texte contenant « authentifié »
+              for a in soup.find_all("a", href=True):
+                  label = normalize_txt(a.get_text(" ", strip=True))
+                  if any(p in label for p in TARGET_PATTERNS):
+                      return urljoin(base, a["href"])
+              # 2) Attributs (title/aria-label/download)
+              for a in soup.find_all("a", href=True):
+                  meta = " ".join(filter(None, [a.get("title",""), a.get("aria-label",""), a.get("download","")]))
+                  if meta and any(p in normalize_txt(meta) for p in TARGET_PATTERNS):
+                      return urljoin(base, a["href"])
+              # 3) Repli: lien direct .pdf
+              for a in soup.find_all("a", href=True):
+                  href = a["href"]
+                  if href.lower().endswith(".pdf"):
+                      return urljoin(base, href)
+              # 4) Repli: texte contenant pdf
+              for a in soup.find_all("a", href=True):
+                  if "pdf" in normalize_txt(a.get_text(" ", strip=True)):
+                      return urljoin(base, a["href"])
+              return None
+
+          def safe_filename(name):
+              return re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+
+          def download_pdf(s, url, out_path):
+              with s.get(url, stream=True, timeout=30) as r:
+                  r.raise_for_status()
+                  tmp = out_path + ".part"
+                  os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                  h = hashlib.sha256()
+                  total = 0
+                  with open(tmp, "wb") as f:
+                      for chunk in r.iter_content(chunk_size=1024*128):
+                          if not chunk: continue
+                          f.write(chunk); h.update(chunk); total += len(chunk)
+                  os.replace(tmp, out_path)
+              return total, h.hexdigest()
+
+          def main():
+              s = session_with_retry()
+              r = s.get(BASE_URL, timeout=20)
+              if r.status_code != 200:
+                  print(f"[ERREUR] {r.status_code} sur {BASE_URL}", file=sys.stderr)
+                  sys.exit(1)
+              issue_url = find_latest_issue_url(r.text)
+              if not issue_url:
+                  print("[ERREUR] Lien du dernier JO introuvable", file=sys.stderr)
+                  sys.exit(2)
+              print(f"[INFO] Dernier JO: {issue_url}")
+
+              r2 = s.get(issue_url, timeout=20)
+              if r2.status_code != 200:
+                  print(f"[ERREUR] {r2.status_code} sur {issue_url}", file=sys.stderr)
+                  sys.exit(3)
+
+              pdf_url = find_pdf_url(r2.text, base=issue_url)
+              if not pdf_url:
+                  print("[ERREUR] Lien « authentifié » introuvable", file=sys.stderr)
+                  sys.exit(4)
+              print(f"[INFO] PDF authentifié: {pdf_url}")
+
+              # Date déduite si possible
+              import datetime as dt
+              guess_date = dt.date.today()
+              m = re.search(r"(20\\d{2})[^\\d]?(0[1-9]|1[0-2])[^\\d]?([0-2]\\d|3[01])", r2.text)
+              if m:
+                  try:
+                      guess_date = dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                  except ValueError:
+                      pass
+
+              out_dir = os.path.join(OUT_DIR, guess_date.strftime("%Y-%m-%d"))
+              fname = safe_filename(f"JO-{guess_date.isoformat()}.pdf")
+              out_path = os.path.join(out_dir, fname)
+
+              size, sha = download_pdf(s, pdf_url, out_path)
+              print(f"[OK] Téléchargé {size/1024:.1f} KiB → {out_path}")
+              print(f"[OK] SHA256={sha}")
+
+          if __name__ == "__main__":
+              time.sleep(1)
+              main()
+          PY
+
+      - name: Upload PDF as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: JORF-PDF
+          path: out/**.pdf
+          if-no-files-found: warn
+
+      # --- Option : commit dans le repo (décommente si tu veux pousser le PDF) ---
+      # - name: Commit PDF
+      #   run: |
+      #     git config user.name "github-actions[bot]"
+      #     git config user.email "github-actions[bot]@users.noreply.github.com"
+      #     git add out
+      #     git commit -m "Add JO PDF"
+      #     git push
 
